@@ -15,11 +15,19 @@ import warnings
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import adbutils
 import requests
 from lxml import etree
-from PIL import Image
 from retry import retry
+
+try:
+    import adbutils
+except ImportError:
+    adbutils = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from uiautomator2 import xpath
 from uiautomator2._input import InputMethodMixIn
