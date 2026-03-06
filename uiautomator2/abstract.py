@@ -4,6 +4,8 @@
 """Created on Thu Apr 25 2024 15:08:43 by codeskyblue
 """
 
+from __future__ import annotations
+
 import abc
 import typing
 from typing import Any, List, NamedTuple, Tuple, Union
