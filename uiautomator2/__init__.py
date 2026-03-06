@@ -16,6 +16,7 @@ from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import adbutils
+import requests
 from lxml import etree
 from PIL import Image
 from retry import retry
@@ -35,6 +36,7 @@ from uiautomator2.watcher import WatchContext, Watcher
 WAIT_FOR_DEVICE_TIMEOUT = int(os.getenv("WAIT_FOR_DEVICE_TIMEOUT", 20))
 
 logger = logging.getLogger(__name__)
+_HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 def enable_pretty_logging(level=logging.DEBUG):
     if not logger.handlers: # pragma: no cover
@@ -938,7 +940,707 @@ class Session(Device):
         self.close()
 
 
-def connect(serial: Union[str, adbutils.AdbDevice] = None) -> Device:
+def _is_http_url(value: Optional[str]) -> bool:
+    return isinstance(value, str) and _HTTP_URL_RE.match(value) is not None
+
+
+def _normalize_rpc_endpoint(url: str) -> str:
+    endpoint = url.rstrip("/")
+    if endpoint.endswith("/jsonrpc/0"):
+        return endpoint
+    if endpoint.endswith("/jsonrpc"):
+        return endpoint + "/0"
+    return endpoint + "/jsonrpc/0"
+
+
+class HTTPDevice(_PluginMixIn, InputMethodMixIn, _DeprecatedMixIn):
+    """Direct JSON-RPC client that talks to u2.jar HTTP server without ADB."""
+
+    _ORIENTATION = (
+        (0, "natural", "n", 0),
+        (1, "left", "l", 90),
+        (2, "upsidedown", "u", 180),
+        (3, "right", "r", 270),
+    )
+
+    def __init__(self, rpc_url: str):
+        self._debug = False
+        self._rpc_endpoint = _normalize_rpc_endpoint(rpc_url)
+
+    @property
+    def debug(self) -> bool:
+        return self._debug
+
+    @debug.setter
+    def debug(self, value: bool):
+        self._debug = bool(value)
+
+    @property
+    def info(self) -> Dict[str, Any]:
+        return self.jsonrpc.deviceInfo(http_timeout=10)
+
+    @cached_property
+    def settings(self) -> Settings:
+        return Settings(self)
+
+    def start_uiautomator(self):
+        raise DeviceError("HTTPDevice cannot start uiautomator service remotely")
+
+    def stop_uiautomator(self):
+        raise DeviceError("HTTPDevice cannot stop uiautomator service remotely")
+
+    def reset_uiautomator(self):
+        raise DeviceError("HTTPDevice cannot reset uiautomator service remotely")
+
+    def shell(self, cmdargs: Union[str, List[str]], timeout=60) -> ShellResponse:
+        cmdline = list2cmdline(cmdargs)
+        result = self._raw_jsonrpc_call(
+            "executeShellCommand",
+            (cmdline, int(timeout * 1000)),
+            HTTP_TIMEOUT,
+        )
+        if isinstance(result, dict):
+            stdout = result.get("stdout", "") or ""
+            stderr = result.get("stderr", "") or ""
+            code = int(result.get("returnCode", 0))
+            return ShellResponse(stdout + stderr, code)
+        return ShellResponse(str(result), 0)
+
+    @property
+    def adb_device(self) -> adbutils.AdbDevice:
+        raise DeviceError("HTTPDevice has no adb device")
+
+    def push(self, src, dst: str, mode=0o644):
+        _ = (src, dst, mode)
+        raise DeviceError("HTTPDevice.push is not supported")
+
+    def pull(self, src: str, dst: str):
+        _ = (src, dst)
+        raise DeviceError("HTTPDevice.pull is not supported")
+
+    def window_size(self) -> Tuple[int, int]:
+        info = self.info
+        return info["displayWidth"], info["displayHeight"]
+
+    def show_touch_trace(self, pointer_location: bool = True, show_touches: bool = True):
+        self.shell(f"settings put system pointer_location {int(pointer_location)}")
+        self.shell(f"settings put system show_touches {int(show_touches)}")
+
+    def implicitly_wait(self, seconds: Optional[float] = None) -> float:
+        if seconds:
+            self.settings["wait_timeout"] = seconds
+        return self.settings["wait_timeout"]
+
+    def sleep(self, seconds: float):
+        time.sleep(seconds)
+
+    @property
+    def pos_rel2abs(self):
+        size = []
+
+        def _convert(x, y):
+            assert x >= 0
+            assert y >= 0
+
+            if (x < 1 or y < 1) and not size:
+                size.extend(self.window_size())
+
+            if x < 1:
+                x = int(size[0] * x)
+            if y < 1:
+                y = int(size[1] * y)
+            return x, y
+
+        return _convert
+
+    @contextlib.contextmanager
+    def _operation_delay(self, operation_name: str = None):
+        before, after = self.settings["operation_delay"]
+        if operation_name not in self.settings["operation_delay_methods"]:
+            before, after = 0, 0
+
+        if before:
+            logger.debug("operation [%s] pre-delay %ss", operation_name, before)
+            time.sleep(before)
+        yield
+        if after:
+            logger.debug("operation [%s] post-delay %ss", operation_name, after)
+            time.sleep(after)
+
+    def _raw_jsonrpc_call(self, method: str, params: Any = None, timeout: float = 10) -> Any:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }
+        headers = {
+            "User-Agent": "uiautomator2",
+            "Accept-Encoding": "",
+            "Content-Type": "application/json",
+        }
+        try:
+            response = requests.post(
+                self._rpc_endpoint, json=payload, headers=headers, timeout=timeout
+            )
+        except requests.Timeout as e:
+            raise HTTPTimeoutError(f"HTTP request timeout: {e}") from e
+        except requests.RequestException as e:
+            raise HTTPError(f"HTTP request failed: {e}") from e
+
+        if response.status_code != 200:
+            raise HTTPError(f"HTTP request failed: {response.status_code} {response.reason}")
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            raise RPCInvalidError(f"Unknown RPC error: invalid json: {e}") from e
+
+        if not isinstance(data, dict):
+            raise RPCInvalidError("Unknown RPC error: not a dict")
+
+        if "error" in data:
+            code = data["error"].get("code")
+            message = data["error"].get("message", "")
+            stacktrace = data["error"].get("data")
+            if "UiAutomation not connected" in response.text:
+                raise UiAutomationNotConnectedError("UiAutomation not connected")
+            if "android.os.DeadObjectException" in message:
+                raise UiAutomationNotConnectedError("android.os.DeadObjectException")
+            if "android.os.DeadSystemRuntimeException" in message:
+                raise UiAutomationNotConnectedError("android.os.DeadSystemRuntimeException")
+            if "uiautomator.UiObjectNotFoundException" in message:
+                raise UiObjectNotFoundError(code, message, params)
+            if "java.lang.StackOverflowError" in message:
+                trimmed_stacktrace = (stacktrace or "")[:1000] + "..." + (stacktrace or "")[-1000:]
+                raise RPCStackOverflowError(
+                    f"StackOverflowError: {message}",
+                    params,
+                    trimmed_stacktrace,
+                )
+            raise RPCUnknownError(f"Unknown RPC error: {code} {message}", params, stacktrace)
+
+        if "result" not in data:
+            raise RPCInvalidError("Unknown RPC error: no result field")
+        return data["result"]
+
+    def jsonrpc_call(self, method: str, params: Any = None, timeout: float = 10) -> Any:
+        return self._raw_jsonrpc_call(method, params, timeout)
+
+    @property
+    def jsonrpc(self):
+        class JSONRpcWrapper():
+            def __init__(self, server: "HTTPDevice"):
+                self.server = server
+                self.method = None
+
+            def __getattr__(self, method):
+                self.method = method
+                return self
+
+            def __call__(self, *args, **kwargs):
+                http_timeout = kwargs.pop("http_timeout", HTTP_TIMEOUT)
+                params = args if args else kwargs
+                return self.server.jsonrpc_call(self.method, params, http_timeout)
+
+        return JSONRpcWrapper(self)
+
+    @retry(HierarchyEmptyError, tries=3, delay=1)
+    def _do_dump_hierarchy(self, compressed=False, max_depth=None) -> str:
+        if max_depth is None:
+            max_depth = 50
+        content = self.jsonrpc.dumpWindowHierarchy(compressed, max_depth)
+        if content == "":
+            raise HierarchyEmptyError("dump hierarchy is empty")
+        if '<hierarchy rotation="0" />' in content:
+            raise HierarchyEmptyError("dump hierarchy is empty with no children")
+        return content
+
+    def dump_hierarchy(self, compressed=False, pretty=False, max_depth: Optional[int] = None) -> str:
+        try:
+            if max_depth is None:
+                max_depth = self.settings["max_depth"]
+            content = self._do_dump_hierarchy(compressed, max_depth)
+        except HierarchyEmptyError:  # pragma: no cover
+            logger.warning("dump empty, return empty xml")
+            content = "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>\r\n<hierarchy rotation=\"0\" />"
+
+        if pretty:
+            root = etree.fromstring(content.encode("utf-8"))
+            content = etree.tostring(root, pretty_print=True, encoding="UTF-8", xml_declaration=True)
+            content = content.decode("utf-8")
+        return content
+
+    def screenshot(self, filename: Optional[str] = None, format="pillow", display_id: Optional[int] = None):
+        _ = display_id
+        base64_data = self.jsonrpc.takeScreenshot(1, 80)
+        if not base64_data:
+            if self.settings["fallback_to_blank_screenshot"]:
+                pil_img = Image.new("RGB", self.window_size(), (0, 0, 0))
+            else:
+                raise UiAutomationError("takeScreenshot failed")
+        else:
+            jpg_raw = base64.b64decode(base64_data)
+            pil_img = Image.open(io.BytesIO(jpg_raw))
+
+        if filename:
+            pil_img.save(filename)
+            return
+        return image_convert(pil_img, format)
+
+    def click(self, x: Union[float, int], y: Union[float, int]):
+        x, y = self.pos_rel2abs(x, y)
+        with self._operation_delay("click"):
+            self.jsonrpc.click(x, y)
+
+    def long_click(self, x, y, duration: float = .5):
+        x, y = self.pos_rel2abs(x, y)
+        with self._operation_delay("click"):
+            self.jsonrpc.click(x, y, int(duration * 1000))
+
+    def double_click(self, x, y, duration=0.1):
+        x, y = self.pos_rel2abs(x, y)
+        self.click(x, y)
+        time.sleep(duration)
+        self.click(x, y)
+
+    def swipe(self, fx, fy, tx, ty, duration: Optional[float] = None, steps: Optional[int] = None):
+        if duration is not None and steps is not None:
+            warnings.warn("duration and steps can not be set at the same time, use steps", UserWarning)
+            duration = None
+        if duration:
+            steps = int(duration * 200)
+        if not steps:
+            steps = SCROLL_STEPS
+        rel2abs = self.pos_rel2abs
+        fx, fy = rel2abs(fx, fy)
+        tx, ty = rel2abs(tx, ty)
+        steps = max(2, steps)
+        with self._operation_delay("swipe"):
+            return self.jsonrpc.swipe(fx, fy, tx, ty, steps)
+
+    def swipe_points(self, points: List[Tuple[int, int]], duration: float = 0.5):
+        ppoints = []
+        rel2abs = self.pos_rel2abs
+        for p in points:
+            x, y = rel2abs(p[0], p[1])
+            ppoints.append(x)
+            ppoints.append(y)
+        steps = int(duration / .005)
+        return self.jsonrpc.swipePoints(ppoints, steps)
+
+    def drag(self, sx, sy, ex, ey, duration=0.5):
+        rel2abs = self.pos_rel2abs
+        sx, sy = rel2abs(sx, sy)
+        ex, ey = rel2abs(ex, ey)
+        with self._operation_delay("drag"):
+            return self.jsonrpc.drag(sx, sy, ex, ey, int(duration * 200))
+
+    def press(self, key: Union[int, str], meta=None):
+        with self._operation_delay("press"):
+            if isinstance(key, int):
+                return self.jsonrpc.pressKeyCode(key, meta) if meta else self.jsonrpc.pressKeyCode(key)
+            return self.jsonrpc.pressKey(key)
+
+    def long_press(self, key: Union[int, str]):
+        with self._operation_delay("press"):
+            if isinstance(key, int):
+                self.shell(f"input keyevent --longpress {key}")
+            else:
+                self.shell(f"input keyevent --longpress {key.upper()}")
+
+    def screen_on(self):
+        self.jsonrpc.wakeUp()
+
+    def screen_off(self):
+        self.jsonrpc.sleep()
+
+    @property
+    def orientation(self) -> str:
+        return self._ORIENTATION[self.info["displayRotation"]][1]
+
+    @orientation.setter
+    def orientation(self, value: str):
+        for values in self._ORIENTATION:
+            if value in values:
+                self.jsonrpc.setOrientation(values[1])
+                return
+        raise ValueError("Invalid orientation.")
+
+    def freeze_rotation(self, freezed: bool = True):
+        self.jsonrpc.freezeRotation(freezed)
+
+    def open_notification(self):
+        return self.jsonrpc.openNotification()
+
+    def open_quick_settings(self):
+        return self.jsonrpc.openQuickSettings()
+
+    def open_url(self, url: str):
+        self.shell(["am", "start", "-a", "android.intent.action.VIEW", "-d", url])
+
+    @property
+    def clipboard(self) -> Optional[str]:
+        return self.jsonrpc.getClipboard()
+
+    @clipboard.setter
+    def clipboard(self, text: str):
+        self.set_clipboard(text)
+
+    def set_clipboard(self, text, label=None):
+        self.jsonrpc.setClipboard(label, text)
+
+    def clear_text(self):
+        self.jsonrpc.clearInputText()
+
+    def send_keys(self, text: str, clear: bool = False):
+        if clear:
+            self.clear_text()
+        self.clipboard = text
+        if self.clipboard != text:
+            raise UiAutomationError("setClipboard failed")
+        self.jsonrpc.pasteClipboard()
+
+    @property
+    def last_traversed_text(self):
+        return self.jsonrpc.getLastTraversedText()
+
+    def clear_traversed_text(self):
+        self.jsonrpc.clearLastTraversedText()
+
+    @property
+    def last_toast(self) -> Optional[str]:
+        return self.jsonrpc.getLastToast()
+
+    def clear_toast(self):
+        self.jsonrpc.clearLastToast()
+
+    def keyevent(self, v):
+        self.shell("input keyevent " + str(v).upper())
+
+    def _compat_shell_ps(self) -> str:
+        output = self.shell("ps -A").output
+        if len(output.strip().splitlines()) <= 1:
+            output = self.shell("ps").output
+        return output.strip().replace("\r\n", "\n")
+
+    def _pidof_app(self, package_name) -> Optional[int]:
+        output = self._compat_shell_ps()
+        for line in output.splitlines():
+            fields = line.strip().split()
+            if len(fields) < 2:
+                continue
+            if fields[-1] == package_name and fields[1].isdigit():
+                return int(fields[1])
+        return None
+
+    def app_current(self):
+        package = (self.info or {}).get("currentPackageName")
+        if not package:
+            raise DeviceError("Couldn't get focused app")
+
+        activity = None
+        try:
+            output = self.shell(["dumpsys", "window", "windows"]).output
+            patterns = [
+                r"mCurrentFocus=Window\{\S+\s+\S+\s+([^/\s]+)/([^\}\s]+)\}",
+                r"mFocusedApp=.*\s([^/\s]+)/([^\}\s]+)\}",
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, output)
+                if m and m.group(1) == package:
+                    activity = m.group(2)
+                    break
+        except Exception:
+            logger.debug("parse app_current activity failed", exc_info=True)
+
+        result = {"package": package, "activity": activity}
+        pid = self._pidof_app(package)
+        if pid:
+            result["pid"] = pid
+        return result
+
+    def wait_activity(self, activity, timeout=10) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            current_activity = self.app_current().get("activity")
+            if activity == current_activity:
+                return True
+            time.sleep(.5)
+        return False
+
+    def app_start(
+        self,
+        package_name: str,
+        activity: Optional[str] = None,
+        wait: bool = False,
+        stop: bool = False,
+        use_monkey: bool = False,
+    ):
+        if stop:
+            self.app_stop(package_name)
+
+        if use_monkey or not activity:
+            self.shell(
+                [
+                    "monkey",
+                    "-p",
+                    package_name,
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                    "1",
+                ]
+            )
+            if wait:
+                self.app_wait(package_name)
+            return
+
+        args = [
+            "am",
+            "start",
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "-n",
+            f"{package_name}/{activity}",
+        ]
+        self.shell(args)
+        if wait:
+            self.app_wait(package_name)
+
+    def app_wait(self, package_name: str, timeout: float = 20.0, front=False) -> int:
+        pid = None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if front:
+                if self.app_current()["package"] == package_name:
+                    pid = self._pidof_app(package_name)
+            else:
+                if package_name in self.app_list_running():
+                    pid = self._pidof_app(package_name)
+            if pid:
+                return pid
+            time.sleep(1)
+        return pid or 0
+
+    def app_list(self, filter: str = None) -> List[str]:
+        cmd = ["pm", "list", "packages"]
+        if filter:
+            cmd.append(filter)
+        output = self.shell(cmd).output
+        return re.findall(r"package:([^\s]+)", output)
+
+    def app_list_running(self) -> List[str]:
+        packages = set(self.app_list())
+        ps_output = self._compat_shell_ps()
+        process_names = re.findall(r"(\S+)$", ps_output, re.M)
+        return list(packages.intersection(process_names))
+
+    def app_stop(self, package_name: str):
+        self.shell(["am", "force-stop", package_name])
+
+    def app_stop_all(self, excludes=[]):
+        our_apps = ["com.github.uiautomator", "com.github.uiautomator.test"]
+        kill_pkgs = set(self.app_list_running()).difference(our_apps + excludes)
+        for pkg_name in kill_pkgs:
+            self.app_stop(pkg_name)
+        return list(kill_pkgs)
+
+    def app_clear(self, package_name: str):
+        self.shell(["pm", "clear", package_name])
+
+    def app_uninstall(self, package_name: str) -> bool:
+        ret = self.shell(["pm", "uninstall", package_name])
+        return ret.exit_code == 0
+
+    def app_info(self, package_name: str) -> Dict[str, Any]:
+        output = self.shell(["dumpsys", "package", package_name]).output
+        if f"Package [{package_name}]" not in output and f"Package [{package_name} ]" not in output:
+            raise AppNotFoundError("App not installed", package_name)
+
+        version_name_match = re.search(r"versionName=([^\s]+)", output)
+        version_code_match = re.search(r"versionCode=(\d+)", output)
+        return {
+            "versionName": version_name_match.group(1) if version_name_match else "",
+            "versionCode": int(version_code_match.group(1)) if version_code_match else 0,
+        }
+
+    def app_uninstall_all(self, excludes=[], verbose=False):
+        our_apps = ["com.github.uiautomator", "com.github.uiautomator.test"]
+        output = self.shell(["pm", "list", "packages", "-3"]).output
+        pkgs = re.findall(r"package:([^\s]+)", output)
+        pkgs = set(pkgs).difference(our_apps + excludes)
+        pkgs = list(pkgs)
+        for pkg_name in pkgs:
+            if verbose:
+                print("uninstalling", pkg_name, " ", end="", flush=True)
+            ok = self.app_uninstall(pkg_name)
+            if verbose:
+                print("OK" if ok else "FAIL")
+        return pkgs
+
+    def app_auto_grant_permissions(self, package_name: str):
+        sdk_version_output = self.shell(["getprop", "ro.build.version.sdk"]).output.strip()
+        sdk_version = int(sdk_version_output) if sdk_version_output.isdigit() else None
+        if sdk_version is None:
+            logger.warning("can't get sdk version")
+            return
+        if sdk_version < 23:
+            logger.warning("auto grant permissions only support android 6.0+ (API 23+)")
+            return
+
+        dumpsys_package_output = self.shell(["dumpsys", "package", package_name]).output
+        target_sdk_match = re.search(r"targetSdk=(\d+)", dumpsys_package_output)
+        if not target_sdk_match:
+            logger.warning("can't get targetSdk from dumpsys package")
+            return
+        target_sdk = int(target_sdk_match.group(1))
+        if target_sdk < 22:
+            logger.warning("auto grant permissions only support app targetSdk >= 22")
+            return
+
+        permissions = re.findall(
+            r"(android\.\w*\.?permission\.\w+): granted=false",
+            dumpsys_package_output,
+        )
+        for permission in permissions:
+            self.shell(["pm", "grant", package_name, permission])
+            logger.info("auto grant permission %s", permission)
+
+    def app_install(self, data: str):
+        if not isinstance(data, str):
+            raise DeviceError("HTTPDevice.app_install only supports str path/url")
+
+        data = data.strip()
+        if not data:
+            raise DeviceError("empty install path/url")
+
+        if data.startswith("http://") or data.startswith("https://"):
+            target = "/data/local/tmp/u2_http_install.apk"
+            download_cmd = (
+                f"(curl -L -o {target} {data} || "
+                f"toybox wget -O {target} {data} || "
+                f"wget -O {target} {data})"
+            )
+            ret = self.shell(download_cmd, timeout=300)
+            if ret.exit_code != 0:
+                raise DeviceError(f"download apk failed: {ret.output}")
+            install_ret = self.shell(["pm", "install", "-r", target], timeout=300)
+            if install_ret.exit_code != 0:
+                raise DeviceError(f"install apk failed: {install_ret.output}")
+            return
+
+        if os.path.isabs(data):
+            if os.path.exists(data):
+                raise DeviceError("local apk file install is not supported over HTTP, use device path or URL")
+            install_ret = self.shell(["pm", "install", "-r", data], timeout=300)
+            if install_ret.exit_code != 0:
+                raise DeviceError(f"install apk failed: {install_ret.output}")
+            return
+
+        raise DeviceError("unsupported install path, use device absolute path or URL")
+
+    def session(self, package_name: str, attach: bool = False) -> "HTTPSession":
+        self.app_start(package_name, stop=not attach)
+        pid = self.app_wait(package_name)
+        return HTTPSession(self._rpc_endpoint, package_name, pid=pid)
+
+    def exists(self, **kwargs):
+        return self(**kwargs).exists
+
+    @property
+    def touch(self):
+        ACTION_DOWN = 0
+        ACTION_MOVE = 2
+        ACTION_UP = 1
+        obj = self
+
+        class _Touch(object):
+            def down(self, x, y):
+                x, y = obj.pos_rel2abs(x, y)
+                obj.jsonrpc.injectInputEvent(ACTION_DOWN, x, y, 0)
+                return self
+
+            def move(self, x, y):
+                x, y = obj.pos_rel2abs(x, y)
+                obj.jsonrpc.injectInputEvent(ACTION_MOVE, x, y, 0)
+                return self
+
+            def up(self, x, y):
+                x, y = obj.pos_rel2abs(x, y)
+                obj.jsonrpc.injectInputEvent(ACTION_UP, x, y, 0)
+                return self
+
+            def sleep(self, seconds: float):
+                time.sleep(seconds)
+                return self
+
+        return _Touch()
+
+    @cached_property
+    def serial(self) -> str:
+        return self._rpc_endpoint
+
+    @cached_property
+    def swipe_ext(self) -> SwipeExt:
+        return SwipeExt(self)
+
+    @cached_property
+    def watcher(self) -> Watcher:
+        return Watcher(self)
+
+    @cached_property
+    def xpath(self) -> xpath.XPathEntry:
+        return xpath.XPathEntry(self)
+
+    def __call__(self, **kwargs) -> "UiObject":
+        return UiObject(self, Selector(**kwargs))
+
+
+class HTTPSession(HTTPDevice):
+    """Session for HTTPDevice, validates target app process before each JSON-RPC call."""
+
+    def __init__(self, rpc_url: str, package_name: str, pid: Optional[int] = None):
+        super().__init__(rpc_url)
+        self._package_name = package_name
+        self._pid = pid if pid is not None else self.app_wait(self._package_name)
+
+    def running(self) -> bool:
+        return self._pid == self._pidof_app(self._package_name)
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    def jsonrpc_call(self, method: str, params: Any = None, timeout: float = 10) -> Any:
+        if method == "executeShellCommand":
+            return self._raw_jsonrpc_call(method, params, timeout)
+        if not self.running():
+            raise SessionBrokenError(f"app:{self._package_name} pid:{self._pid} is quit")
+        return super().jsonrpc_call(method, params, timeout)
+
+    def restart(self):
+        self.app_start(self._package_name, wait=True, stop=True)
+        self._pid = self._pidof_app(self._package_name)
+
+    def close(self):
+        self.app_stop(self._package_name)
+        self._pid = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def connect_http(rpc_url: str) -> HTTPDevice:
+    """Connect directly to a u2.jar JSON-RPC endpoint over HTTP."""
+    return HTTPDevice(rpc_url)
+
+
+def connect(serial: Union[str, adbutils.AdbDevice] = None) -> Union[Device, HTTPDevice]:
     """
     Args:
         serial (str): Android device serialno
@@ -952,9 +1654,18 @@ def connect(serial: Union[str, adbutils.AdbDevice] = None) -> Device:
     Example:
         connect("10.0.0.1:5555")
         connect("cff1123ea")  # adb device serial number
+        connect("http://192.168.50.27:9008")
     """
+    if _is_http_url(serial):
+        return connect_http(serial)
+
     if not serial:
+        rpc_url = os.getenv("UIAUTOMATOR2_RPC_URL")
+        if rpc_url:
+            return connect_http(rpc_url)
         serial = os.getenv("ANDROID_SERIAL")
+        if _is_http_url(serial):
+            return connect_http(serial)
     return connect_usb(serial)
 
 
