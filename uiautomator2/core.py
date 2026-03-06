@@ -4,6 +4,8 @@
 """Created on Thu Apr 25 2024 14:50:05 by codeskyblue
 """
 
+from __future__ import annotations
+
 import atexit
 import datetime
 import hashlib
@@ -16,7 +18,10 @@ from http.client import HTTPConnection
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-import adbutils
+try:
+    import adbutils
+except ImportError:
+    adbutils = None
 import requests
 
 from uiautomator2.abstract import AbstractUiautomatorServer
