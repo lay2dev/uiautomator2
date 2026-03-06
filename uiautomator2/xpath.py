@@ -13,7 +13,10 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from lxml import etree
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from uiautomator2._proto import Direction
 from uiautomator2.abstract import AbstractXPathBasedDevice

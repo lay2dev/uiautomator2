@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-import adbutils
+try:
+    import adbutils
+except ImportError:
+    adbutils = None
 from retry import retry
 
 from uiautomator2.abstract import AbstractShell

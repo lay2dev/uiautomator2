@@ -3,7 +3,10 @@ import time
 import warnings
 from typing import Optional, Tuple, List, Dict
 
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 from retry import retry
 
 from uiautomator2._proto import SCROLL_STEPS

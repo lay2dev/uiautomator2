@@ -12,7 +12,10 @@ import typing
 import warnings
 from typing import Iterable, List, Tuple, Union
 
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from uiautomator2._proto import Direction
 from uiautomator2.exceptions import SessionBrokenError, UiObjectNotFoundError

@@ -6,7 +6,10 @@ import time
 from functools import cached_property
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import adbutils
+try:
+    import adbutils
+except ImportError:
+    adbutils = None
 
 from uiautomator2._proto import HTTP_TIMEOUT, SCROLL_STEPS, Direction
 from uiautomator2.abstract import ShellResponse

@@ -8,8 +8,15 @@ import abc
 import typing
 from typing import Any, List, NamedTuple, Tuple, Union
 
-import adbutils
-from PIL import Image
+try:
+    import adbutils
+except ImportError:
+    adbutils = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from uiautomator2._proto import Direction
 
