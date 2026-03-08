@@ -1299,15 +1299,26 @@ class HTTPDevice(_PluginMixIn, InputMethodMixIn, _DeprecatedMixIn):
         self.jsonrpc.setClipboard(label, text)
 
     def clear_text(self):
-        self.jsonrpc.clearInputText()
+        if self.is_input_ime_installed():
+            InputMethodMixIn.clear_text(self)
+        else:
+            self.jsonrpc.clearInputText()
 
     def send_keys(self, text: str, clear: bool = False):
         if clear:
             self.clear_text()
-        self.clipboard = text
-        if self.clipboard != text:
-            raise UiAutomationError("setClipboard failed")
-        self.jsonrpc.pasteClipboard()
+        if self.is_input_ime_installed():
+            InputMethodMixIn.send_keys(self, text)
+            return
+        try:
+            # fallback to clipboard
+            self.clipboard = text
+            if self.clipboard != text:
+                raise UiAutomationError("setClipboard failed")
+            self.jsonrpc.pasteClipboard()
+        except:
+            # clipboard failed, install IME and retry
+            InputMethodMixIn.send_keys(self, text)
 
     @property
     def last_traversed_text(self):
